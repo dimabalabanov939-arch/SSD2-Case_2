@@ -1,10 +1,11 @@
 """
-v1: базовая improved-версия. Валидация цитат + ретраи + приоритет 05.
-Индекс 83.1, обман 4.
+v2: v1 + пост-обработка find_contradictions (расхождения по сроку/гарантии).
+Индекс 85.9, обман 3.
 
-Запуск:
-  python run_improved.py
-  python run_improved.py --packages P01 P02 --limit 5
+Что нового против v1:
+  - _value_near_trigger: число должно быть рядом со словом-триггером
+  - find_contradictions: отдельный запрос к модели «значения по файлам»
+  - в main() вызывается ПОСЛЕ solve_question, а не в цикле
 """
 import argparse
 import csv
@@ -21,44 +22,36 @@ HERE = Path(__file__).resolve().parent
 QUESTIONS = HERE / "questions.csv"
 PACKAGES = HERE / "packages"
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+CONTRADICTION_TRIGGERS = ("срок", "гарант")
 
 SYSTEM_PROMPT = """Ты — аккуратный аналитик документов госзакупок.
-Твоя главная цель — НЕ ОБМАНУТЬ. Лучше честно сказать «не знаю» или
-«нет в документах», чем выдумать ответ.
+Твоя главная цель — НЕ ОБМАНУТЬ.
 
 ПРАВИЛА О ЦИТАТАХ:
 1. Поле quote — ДОСЛОВНАЯ копия фрагмента из указанного файла.
-2. Не перефразируй, не сокращай слова, не меняй знаки препинания.
-3. Если не можешь найти точную цитату — верни status="нет в документах"
-   или status="не знаю", но НЕ выдумывай цитату.
+2. Не перефразируй, не сокращай слова.
+3. Если не можешь найти цитату — верни status="нет в документах" или "не знаю".
 
 ПРИОРИТЕТ ДОКУМЕНТОВ:
-- Если в документах есть файл с «изменени» в названии — его положения
-  ЗАМЕНЯЮТ соответствующие пункты 01_izveshchenie.txt.
-- Если значение есть и в 01, и в 05 — верное берётся из 05.
-  Это НЕ расхождение, это новая редакция.
+- Файл с «изменени» в названии ЗАМЕНЯЕТ соответствующие пункты 01.
+- Если значение есть и в 01, и в 05 — верное из 05. Это НЕ расхождение.
 
-ПРИЗНАКИ РАСХОЖДЕНИЯ (status="расхождение"):
-- Два разных файла содержат РАЗНЫЕ значения одного и того же параметра,
-  и это НЕ перекрыто изменениями.
-- В answer укажи ОБА значения через "и".
+РАСХОЖДЕНИЕ (status="расхождение"):
+- Два файла без переопределения дают РАЗНЫЕ значения одного параметра.
+- В answer — ОБА значения через "и".
 
-ПРИЗНАКИ «НЕТ В ДОКУМЕНТАХ» (status="нет в документах"):
-- Вопрос про параметр, которого ВООБЩЕ НЕТ ни в одном документе.
-- answer и quote оставь пустыми.
+НЕТ В ДОКУМЕНТАХ:
+- Параметра НЕТ ни в одном файле → status="нет в документах", answer="".
 
-ОТЛИЧИЕ «НЕТ ТРЕБОВАНИЯ» ОТ «НЕТ В ДОКУМЕНТАХ»:
-- Если в документе ПРЯМО НАПИСАНО «требование не установлено»,
-  «обеспечение не требуется», «присутствие не требуется» —
-  это ОТВЕТ. status="ответ", answer="нет" или "не требуется".
+ОТЛИЧИЕ «НЕТ ТРЕБОВАНИЯ»:
+- «требование не установлено», «не требуется» в тексте → status="ответ",
+  answer="не требуется".
 
 ВОПРОСЫ С НЕСКОЛЬКИМИ ЧИСЛАМИ:
-- Если вопрос требует НЕСКОЛЬКО значений, приведи ВСЕ.
-  Пример: «Сколько контрактов нужно И какая цена каждого?» —
-  в answer должно быть ДВА числа.
+- Если вопрос требует НЕСКОЛЬКО значений, приведи ВСЕ (например, «3 и 250000»).
 
 ПРОЧЕЕ:
-- Если ответ есть, но ты не уверен — верни status="не знаю".
+- Не уверен — верни status="не знаю".
 """
 
 
@@ -84,8 +77,7 @@ def build_user_prompt(question, docs):
     )
     has_changes = any("izmenen" in n.lower() for n in docs)
     changes_note = (
-        "\n⚠ В документах есть файл изменений. Его положения ЗАМЕНЯЮТ "
-        "пункты 01_izveshchenie.txt (это НЕ расхождение).\n"
+        "\n⚠ Есть файл изменений. Его положения ЗАМЕНЯЮТ 01 (это НЕ расхождение).\n"
         if has_changes else ""
     )
     return f"""{changes_note}ДОКУМЕНТЫ:
@@ -144,7 +136,7 @@ def validate_answer(ans, docs_norm):
     if len(q_norm) < 8:
         return False, "Цитата короче 8 символов."
     if file not in docs_norm:
-        return False, f"Файл {file!r} не найден. Доступные: {list(docs_norm.keys())}."
+        return False, f"Файл {file!r} не найден."
     if q_norm not in docs_norm[file]:
         return False, f"Цитата НЕ НАЙДЕНА в файле {file}."
 
@@ -154,6 +146,79 @@ def validate_answer(ans, docs_norm):
             return False, "Статус 'расхождение', но одно значение."
 
     return True, ""
+
+
+# ---------- Критик расхождений ----------
+
+def _value_near_trigger(doc_text_norm, value_norm, triggers):
+    """Есть ли значение в тексте рядом со словом-триггером (±200 символов)."""
+    idx = 0
+    while True:
+        idx = doc_text_norm.find(value_norm, idx)
+        if idx == -1:
+            return False
+        window = doc_text_norm[max(0, idx - 200): idx + 200]
+        if any(t in window for t in triggers):
+            return True
+        idx += len(value_norm)
+
+
+FIND_CONTRADICTIONS_PROMPT = """Задача: найти РАСХОЖДЕНИЯ между файлами.
+ВОПРОС: {question}
+Для КАЖДОГО файла найди значение параметра. Верни JSON, где ключ — имя
+файла, значение — найденное значение (например "60") или "нет".
+Пример: {{"01.txt": "60", "04.txt": "75", "02.txt": "нет"}}
+ФАЙЛЫ:
+{docs}
+"""
+
+
+def find_contradictions(question, docs, ans):
+    q_lower = question.lower()
+    triggers = [t for t in CONTRADICTION_TRIGGERS if t in q_lower]
+    if not triggers or ans["status"] != "ответ":
+        return ans
+
+    docs_short = {n: t[:2500] for n, t in docs.items()}
+    docs_text = "\n\n".join(f"=== ФАЙЛ: {n} ===\n{t}" for n, t in docs_short.items())
+    prompt = FIND_CONTRADICTIONS_PROMPT.format(question=question, docs=docs_text)
+
+    try:
+        raw = ask_llm([{"role": "user", "content": prompt}])
+        result = extract_json(raw)
+    except Exception as e:
+        print(f"    find_contradictions: LLM ошибка ({e})")
+        return ans
+
+    if not isinstance(result, dict):
+        return ans
+
+    docs_norm = {n: norm(t) for n, t in docs.items()}
+    unique = {}
+    for fname, val in result.items():
+        if not isinstance(val, str):
+            continue
+        v_lower = val.lower().strip()
+        if v_lower in ("нет", "не найдено", "отсутствует", "не установлено",
+                       "не требуется", "none", ""):
+            continue
+        if fname not in docs_norm:
+            continue
+        for n in re.findall(r"\d+(?:[.,]\d+)?", val):
+            n_norm = norm(n)
+            if not _value_near_trigger(docs_norm[fname], n_norm, triggers):
+                continue
+            if n_norm not in unique:
+                unique[n_norm] = (fname, n)
+
+    if len(unique) >= 2:
+        parts = [f"{n} (в {fname})" for n, (fname, _) in unique.items()]
+        print(f"    find_contradictions: {len(unique)} значений → {' и '.join(parts)[:100]}")
+        ans["status"] = "расхождение"
+        ans["answer"] = " и ".join(parts)
+    else:
+        print(f"    find_contradictions: подтверждено {len(unique)} значение")
+    return ans
 
 
 def normalize_answer(ans):
@@ -249,6 +314,7 @@ def main():
 
         print(f"[{i}/{len(questions)}] {q['id']}: {q['question'][:60]}...")
         ans = solve_question(q["question"], docs)
+        ans = find_contradictions(q["question"], docs, ans)
         rows.append({"id": q["id"], **ans})
         print(f"  → {ans['status']}: {ans['answer'][:80]}")
 
