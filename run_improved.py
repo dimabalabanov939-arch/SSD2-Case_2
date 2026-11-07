@@ -520,7 +520,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--packages", nargs="*", default=None)
-    ap.add_argument("--out", default=str(HERE / "answers_improved.csv"))
+    ap.add_argument("--out", default=str(HERE / "answers.csv"))
     args = ap.parse_args()
 
     questions = load_questions(QUESTIONS)
