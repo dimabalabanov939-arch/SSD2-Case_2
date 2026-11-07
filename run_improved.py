@@ -1,11 +1,15 @@
 """
-v3: лучший рабочий вариант на GigaChat-2. Индекс 90.1, обман 2.
+v4 (регресс): v3 (85.9) + правильная цитата в override_no_requirement
+              + фильтр номеров пунктов в regex backstop.
+Индекс 78.9, обман 1. Откатываем в v5.
 
-Что нового против v2:
-  - _unit_from_question / _value_matches_unit: проверка единицы (месяцы ≠ дни)
-  - _regex_contradiction_backstop: программный поиск, если модель не справилась
-  - override_no_requirement: «нет в документах» → «не требуется»
-  - recalc_contract_security_rub: NMCK × %, приоритет 05, в 05 последний %
+Что нового против v3:
+  - _extract_quote_around: вырезает окно вокруг фразы по границам слов
+  - _is_likely_item_number: отсеивает 4.3., 2.1. для дней/месяцев/лет
+  - override_no_requirement строит цитату через _extract_quote_around
+
+Причина регресса: новая логика цитаты добавила точку нестабильности,
+GigaChat чаще отвечает «не знаю». Откатываем в v5.
 """
 import argparse
 import csv
@@ -148,7 +152,7 @@ def validate_answer(ans, docs_norm):
     return True, ""
 
 
-# ---------- Утилиты: единицы ----------
+# ---------- Утилиты ----------
 
 def _unit_from_question(question):
     q = question.lower()
@@ -163,24 +167,19 @@ def _unit_from_question(question):
     return None
 
 
-def _unit_kind(question):
-    q = question.lower()
-    if "месяц" in q:
-        return "months"
-    if "календарн" in q or "дн" in q:
-        return "days"
-    if "год" in q or "лет" in q:
-        return "years"
-    if "процент" in q or "%" in q:
-        return "percent"
-    return None
-
-
 def _value_matches_unit(doc_text_norm, value_norm, unit_pattern):
     if not unit_pattern:
         return True
     pattern = re.escape(value_norm) + r"[^\d]{0,80}(?:" + unit_pattern + r")"
     return bool(re.search(pattern, doc_text_norm))
+
+
+def _is_likely_item_number(value, question):
+    """4.3., 2.1. — номера пунктов, не значения для дней/месяцев/лет."""
+    if not (("." in value) or ("," in value)):
+        return False
+    q = question.lower()
+    return ("дн" in q) or ("месяц" in q) or ("год" in q) or ("лет" in q)
 
 
 # ---------- Критик расхождений ----------
@@ -199,8 +198,17 @@ def _regex_contradiction_backstop(question, docs_norm):
     q = question.lower()
     if "гарант" in q:
         trigger_re = re.compile(r"гарант\w*")
+        context_markers = []
     elif "срок" in q:
-        trigger_re = re.compile(r"срок\w*")
+        if "выполнен" in q or "работ" in q:
+            trigger_re = re.compile(r"срок\w*\s+(?:выполнени|работ)\w*")
+            context_markers = ["выполнени", "работ"]
+        elif "действ" in q or "контракт" in q:
+            trigger_re = re.compile(r"срок\w*\s+(?:действ|контракт)\w*")
+            context_markers = ["действ", "контракт"]
+        else:
+            trigger_re = re.compile(r"срок\w*")
+            context_markers = []
     else:
         return {}
 
@@ -211,12 +219,17 @@ def _regex_contradiction_backstop(question, docs_norm):
     num_unit_re = re.compile(
         r"(\d+(?:[.,]\d+)?)[^\d]{0,30}(?:" + unit_pattern + r")"
     )
+
     values = {}
     for fname, text in docs_norm.items():
         for tm in trigger_re.finditer(text):
             window = text[tm.start():tm.start() + 250]
+            if context_markers and not any(m in window for m in context_markers):
+                continue
             for nm in num_unit_re.finditer(window):
                 val = nm.group(1).replace(",", ".")
+                if _is_likely_item_number(val, question):
+                    continue
                 values.setdefault(val, set()).add(fname)
     return values
 
@@ -279,6 +292,21 @@ def find_contradictions(question, docs, ans):
 
 # ---------- Пост-обработка: «не требуется» ----------
 
+def _extract_quote_around(text, phrase_pos, phrase_len, window=150):
+    """Вырезает окно вокруг фразы, обрезая по границам слов."""
+    left = max(0, phrase_pos - window)
+    right = min(len(text), phrase_pos + phrase_len + window)
+    if left > 0:
+        sp = text.find(" ", left)
+        if sp != -1 and sp < phrase_pos:
+            left = sp + 1
+    if right < len(text):
+        sp = text.rfind(" ", phrase_pos + phrase_len, right)
+        if sp != -1:
+            right = sp
+    return text[left:right].strip()
+
+
 def override_no_requirement(question, docs, ans):
     if ans["status"] != "нет в документах":
         return ans
@@ -294,30 +322,26 @@ def override_no_requirement(question, docs, ans):
     else:
         return ans
 
-    neg_phrases = ["не установлен", "не требуется", "не предусмотрен"]
+    neg_phrases = ["не установлено", "не установлен", "не требуется",
+                   "не предусмотрено", "не предусмотрен"]
 
     for fname, text in docs.items():
         text_lower = text.lower()
         for m in re.finditer(primary, text_lower):
-            window = text_lower[max(0, m.start() - 30):m.start() + 350]
-            if context not in window:
+            window_text = text_lower[max(0, m.start() - 30):m.start() + 400]
+            if context not in window_text:
                 continue
-            if not any(p in window for p in neg_phrases):
+            hit = next((p for p in neg_phrases if p in window_text), None)
+            if not hit:
                 continue
-            sent_start = text.rfind(".", 0, m.start())
-            if sent_start == -1 or m.start() - sent_start > 300:
-                sent_start = max(0, m.start() - 50)
-            else:
-                sent_start += 1
-            while sent_start < len(text) and text[sent_start].isspace():
-                sent_start += 1
-            sent_end = text.find(".", m.start())
-            if sent_end == -1 or sent_end - sent_start > 300:
-                sent_end = m.start() + 200
-            else:
-                sent_end += 1
-            quote = text[sent_start:sent_end].strip()
-            print(f"    override: «нет в документах» → «не требуется» ({fname})")
+            neg_pos = text_lower.find(hit, max(0, m.start() - 30))
+            if neg_pos == -1:
+                continue
+            quote = _extract_quote_around(text, neg_pos, len(hit))
+            if norm(quote) not in norm(text):
+                quote = text[neg_pos:neg_pos + len(hit) + 80].strip()
+            print(f"    override: «нет в документах» → «не требуется» ({fname}), "
+                  f"цитата: {quote[:80]!r}")
             return {"status": "ответ", "answer": "не требуется",
                     "quote": quote, "file": fname}
     return ans
