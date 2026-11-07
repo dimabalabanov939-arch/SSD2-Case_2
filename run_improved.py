@@ -1,15 +1,12 @@
 """
-v4 (регресс): v3 (85.9) + правильная цитата в override_no_requirement
-              + фильтр номеров пунктов в regex backstop.
-Индекс 78.9, обман 1. Откатываем в v5.
+v5: базовая версия с кэшем. Индекс 97.2 на GigaChat-2-Pro, 1 обман.
+Откат от v4 (регресса): убрана _extract_quote_around, убран _is_likely_item_number.
+Добавлен кэш (cached_call) и GigaChat-2-Pro через .env.
 
-Что нового против v3:
-  - _extract_quote_around: вырезает окно вокруг фразы по границам слов
-  - _is_likely_item_number: отсеивает 4.3., 2.1. для дней/месяцев/лет
-  - override_no_requirement строит цитату через _extract_quote_around
-
-Причина регресса: новая логика цитаты добавила точку нестабильности,
-GigaChat чаще отвечает «не знаю». Откатываем в v5.
+Пост-обработки:
+  1. find_contradictions: расхождения по сроку/гарантии (модель + бэкстоп).
+  2. override_no_requirement: «нет в документах» → «не требуется».
+  3. recalc_contract_security_rub: NMCK × %, приоритет 05, в 05 последний %.
 """
 import argparse
 import csv
@@ -20,6 +17,7 @@ import sys
 from pathlib import Path
 
 from llm_client import ask_llm, extract_json
+from llm_cache import cached_call, flush as cache_flush, stats as cache_stats
 from check import read_file, norm
 
 HERE = Path(__file__).resolve().parent
@@ -174,14 +172,6 @@ def _value_matches_unit(doc_text_norm, value_norm, unit_pattern):
     return bool(re.search(pattern, doc_text_norm))
 
 
-def _is_likely_item_number(value, question):
-    """4.3., 2.1. — номера пунктов, не значения для дней/месяцев/лет."""
-    if not (("." in value) or ("," in value)):
-        return False
-    q = question.lower()
-    return ("дн" in q) or ("месяц" in q) or ("год" in q) or ("лет" in q)
-
-
 # ---------- Критик расхождений ----------
 
 FIND_CONTRADICTIONS_PROMPT = """Задача: найти РАСХОЖДЕНИЯ между файлами.
@@ -228,8 +218,6 @@ def _regex_contradiction_backstop(question, docs_norm):
                 continue
             for nm in num_unit_re.finditer(window):
                 val = nm.group(1).replace(",", ".")
-                if _is_likely_item_number(val, question):
-                    continue
                 values.setdefault(val, set()).add(fname)
     return values
 
@@ -249,7 +237,7 @@ def find_contradictions(question, docs, ans):
 
     unique = {}
     try:
-        raw = ask_llm([{"role": "user", "content": prompt}])
+        raw = cached_call(ask_llm, [{"role": "user", "content": prompt}])
         result = extract_json(raw)
         if isinstance(result, dict):
             for fname, val in result.items():
@@ -292,21 +280,6 @@ def find_contradictions(question, docs, ans):
 
 # ---------- Пост-обработка: «не требуется» ----------
 
-def _extract_quote_around(text, phrase_pos, phrase_len, window=150):
-    """Вырезает окно вокруг фразы, обрезая по границам слов."""
-    left = max(0, phrase_pos - window)
-    right = min(len(text), phrase_pos + phrase_len + window)
-    if left > 0:
-        sp = text.find(" ", left)
-        if sp != -1 and sp < phrase_pos:
-            left = sp + 1
-    if right < len(text):
-        sp = text.rfind(" ", phrase_pos + phrase_len, right)
-        if sp != -1:
-            right = sp
-    return text[left:right].strip()
-
-
 def override_no_requirement(question, docs, ans):
     if ans["status"] != "нет в документах":
         return ans
@@ -322,26 +295,30 @@ def override_no_requirement(question, docs, ans):
     else:
         return ans
 
-    neg_phrases = ["не установлено", "не установлен", "не требуется",
-                   "не предусмотрено", "не предусмотрен"]
+    neg_phrases = ["не установлен", "не требуется", "не предусмотрен"]
 
     for fname, text in docs.items():
         text_lower = text.lower()
         for m in re.finditer(primary, text_lower):
-            window_text = text_lower[max(0, m.start() - 30):m.start() + 400]
-            if context not in window_text:
+            window = text_lower[max(0, m.start() - 30):m.start() + 350]
+            if context not in window:
                 continue
-            hit = next((p for p in neg_phrases if p in window_text), None)
-            if not hit:
+            if not any(p in window for p in neg_phrases):
                 continue
-            neg_pos = text_lower.find(hit, max(0, m.start() - 30))
-            if neg_pos == -1:
-                continue
-            quote = _extract_quote_around(text, neg_pos, len(hit))
-            if norm(quote) not in norm(text):
-                quote = text[neg_pos:neg_pos + len(hit) + 80].strip()
-            print(f"    override: «нет в документах» → «не требуется» ({fname}), "
-                  f"цитата: {quote[:80]!r}")
+            sent_start = text.rfind(".", 0, m.start())
+            if sent_start == -1 or m.start() - sent_start > 300:
+                sent_start = max(0, m.start() - 50)
+            else:
+                sent_start += 1
+            while sent_start < len(text) and text[sent_start].isspace():
+                sent_start += 1
+            sent_end = text.find(".", m.start())
+            if sent_end == -1 or sent_end - sent_start > 300:
+                sent_end = m.start() + 200
+            else:
+                sent_end += 1
+            quote = text[sent_start:sent_end].strip()
+            print(f"    override: «нет в документах» → «не требуется» ({fname})")
             return {"status": "ответ", "answer": "не требуется",
                     "quote": quote, "file": fname}
     return ans
@@ -458,7 +435,7 @@ def solve_question(question, docs):
 
     for attempt in range(MAX_ATTEMPTS):
         try:
-            raw = ask_llm(messages)
+            raw = cached_call(ask_llm, messages)
         except Exception as e:
             print(f"    LLM ошибка: {e}")
             return {"status": "не знаю", "answer": "", "quote": "", "file": ""}
@@ -531,6 +508,8 @@ def main():
     write_answers(rows, args.out)
     print(f"\nСохранено: {args.out}")
     print(f"Дальше: python check.py {args.out}")
+    cache_flush()
+    print(f"Кэш: {cache_stats()}")
 
 
 if __name__ == "__main__":
