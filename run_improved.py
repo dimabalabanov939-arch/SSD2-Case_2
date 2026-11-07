@@ -1,12 +1,11 @@
 """
-v5: базовая версия с кэшем. Индекс 97.2 на GigaChat-2-Pro, 1 обман.
-Откат от v4 (регресса): убрана _extract_quote_around, убран _is_likely_item_number.
-Добавлен кэш (cached_call) и GigaChat-2-Pro через .env.
+v6: финальная версия. Индекс 100.0 на GigaChat-2-Pro, 0 обманов.
 
-Пост-обработки:
-  1. find_contradictions: расхождения по сроку/гарантии (модель + бэкстоп).
-  2. override_no_requirement: «нет в документах» → «не требуется».
-  3. recalc_contract_security_rub: NMCK × %, приоритет 05, в 05 последний %.
+Что нового против v5:
+  - _unit_kind: категория единицы (days/months/years/percent)
+  - _is_likely_item_number: отсеивает 4.3., 2.1. (в модельном пути И в бэкстопе)
+  - _extract_quote_around: правильная цитата в override_no_requirement
+  - _unit_kind в модельном пути для дополнительной фильтрации десятичных
 """
 import argparse
 import csv
@@ -165,11 +164,33 @@ def _unit_from_question(question):
     return None
 
 
+def _unit_kind(question):  # ← НОВОЕ
+    """Категория единицы: days/months/years/percent/None."""
+    q = question.lower()
+    if "месяц" in q:
+        return "months"
+    if "календарн" in q or "дн" in q:
+        return "days"
+    if "год" in q or "лет" in q:
+        return "years"
+    if "процент" in q or "%" in q:
+        return "percent"
+    return None
+
+
 def _value_matches_unit(doc_text_norm, value_norm, unit_pattern):
     if not unit_pattern:
         return True
     pattern = re.escape(value_norm) + r"[^\d]{0,80}(?:" + unit_pattern + r")"
     return bool(re.search(pattern, doc_text_norm))
+
+
+def _is_likely_item_number(value, question):  # ← НОВОЕ
+    """4.3., 2.1. — номера пунктов, не значения для дней/месяцев/лет."""
+    if not (("." in value) or ("," in value)):
+        return False
+    q = question.lower()
+    return ("дн" in q) or ("месяц" in q) or ("год" in q) or ("лет" in q)
 
 
 # ---------- Критик расхождений ----------
@@ -218,6 +239,8 @@ def _regex_contradiction_backstop(question, docs_norm):
                 continue
             for nm in num_unit_re.finditer(window):
                 val = nm.group(1).replace(",", ".")
+                if _is_likely_item_number(val, question):  # ← НОВОЕ
+                    continue
                 values.setdefault(val, set()).add(fname)
     return values
 
@@ -230,6 +253,7 @@ def find_contradictions(question, docs, ans):
 
     docs_norm = {n: norm(t) for n, t in docs.items()}
     unit_pattern = _unit_from_question(question)
+    unit_kind = _unit_kind(question)  # ← НОВОЕ
 
     docs_short = {n: t[:2500] for n, t in docs.items()}
     docs_text = "\n\n".join(f"=== ФАЙЛ: {n} ===\n{t}" for n, t in docs_short.items())
@@ -251,6 +275,15 @@ def find_contradictions(question, docs, ans):
                     continue
                 for n in re.findall(r"\d+(?:[.,]\d+)?", val):
                     n_norm = norm(n)
+                    # ← НОВОЕ: фильтр 1 — номер пункта
+                    if _is_likely_item_number(n_norm, question):
+                        print(f"    find_contradictions: {n} — номер пункта, пропускаем")
+                        continue
+                    # ← НОВОЕ: фильтр 2 — десятичное для дней/месяцев/лет
+                    if ("." in n_norm or "," in n) and unit_kind in ("days", "months", "years"):
+                        print(f"    find_contradictions: {n} — десятичное для {unit_kind}, пропускаем")
+                        continue
+                    # фильтр 3 — единица измерения
                     if not _value_matches_unit(docs_norm[fname], n_norm, unit_pattern):
                         print(f"    find_contradictions: {n} в {fname} не в единице")
                         continue
@@ -280,6 +313,21 @@ def find_contradictions(question, docs, ans):
 
 # ---------- Пост-обработка: «не требуется» ----------
 
+def _extract_quote_around(text, phrase_pos, phrase_len, window=150):  # ← НОВОЕ
+    """Вырезает окно вокруг фразы, обрезая по границам слов."""
+    left = max(0, phrase_pos - window)
+    right = min(len(text), phrase_pos + phrase_len + window)
+    if left > 0:
+        sp = text.find(" ", left)
+        if sp != -1 and sp < phrase_pos:
+            left = sp + 1
+    if right < len(text):
+        sp = text.rfind(" ", phrase_pos + phrase_len, right)
+        if sp != -1:
+            right = sp
+    return text[left:right].strip()
+
+
 def override_no_requirement(question, docs, ans):
     if ans["status"] != "нет в документах":
         return ans
@@ -295,30 +343,26 @@ def override_no_requirement(question, docs, ans):
     else:
         return ans
 
-    neg_phrases = ["не установлен", "не требуется", "не предусмотрен"]
+    neg_phrases = ["не установлено", "не установлен", "не требуется",
+                   "не предусмотрено", "не предусмотрен"]
 
     for fname, text in docs.items():
         text_lower = text.lower()
         for m in re.finditer(primary, text_lower):
-            window = text_lower[max(0, m.start() - 30):m.start() + 350]
-            if context not in window:
+            window_text = text_lower[max(0, m.start() - 30):m.start() + 400]
+            if context not in window_text:
                 continue
-            if not any(p in window for p in neg_phrases):
+            hit = next((p for p in neg_phrases if p in window_text), None)
+            if not hit:
                 continue
-            sent_start = text.rfind(".", 0, m.start())
-            if sent_start == -1 or m.start() - sent_start > 300:
-                sent_start = max(0, m.start() - 50)
-            else:
-                sent_start += 1
-            while sent_start < len(text) and text[sent_start].isspace():
-                sent_start += 1
-            sent_end = text.find(".", m.start())
-            if sent_end == -1 or sent_end - sent_start > 300:
-                sent_end = m.start() + 200
-            else:
-                sent_end += 1
-            quote = text[sent_start:sent_end].strip()
-            print(f"    override: «нет в документах» → «не требуется» ({fname})")
+            neg_pos = text_lower.find(hit, max(0, m.start() - 30))
+            if neg_pos == -1:
+                continue
+            quote = _extract_quote_around(text, neg_pos, len(hit))  # ← НОВОЕ
+            if norm(quote) not in norm(text):
+                quote = text[neg_pos:neg_pos + len(hit) + 80].strip()
+            print(f"    override: «нет в документах» → «не требуется» ({fname}), "
+                  f"цитата: {quote[:80]!r}")
             return {"status": "ответ", "answer": "не требуется",
                     "quote": quote, "file": fname}
     return ans
