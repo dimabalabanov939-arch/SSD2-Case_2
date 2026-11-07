@@ -38,9 +38,14 @@ def _save():
         pickle.dump(_cache, f)
     _dirty = False
 
-
 def make_key(messages, **extra):
-    payload = {"messages": messages, **extra}
+    import os
+    payload = {
+        "messages": messages,
+        "model": os.getenv("LLM_MODEL", ""),
+        "provider": os.getenv("LLM_PROVIDER", ""),
+        **extra,
+    }
     s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
