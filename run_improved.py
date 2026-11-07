@@ -1,11 +1,11 @@
 """
-v2: v1 + пост-обработка find_contradictions (расхождения по сроку/гарантии).
-Индекс 85.9, обман 3.
+v3: лучший рабочий вариант на GigaChat-2. Индекс 90.1, обман 2.
 
-Что нового против v1:
-  - _value_near_trigger: число должно быть рядом со словом-триггером
-  - find_contradictions: отдельный запрос к модели «значения по файлам»
-  - в main() вызывается ПОСЛЕ solve_question, а не в цикле
+Что нового против v2:
+  - _unit_from_question / _value_matches_unit: проверка единицы (месяцы ≠ дни)
+  - _regex_contradiction_backstop: программный поиск, если модель не справилась
+  - override_no_requirement: «нет в документах» → «не требуется»
+  - recalc_contract_security_rub: NMCK × %, приоритет 05, в 05 последний %
 """
 import argparse
 import csv
@@ -148,20 +148,42 @@ def validate_answer(ans, docs_norm):
     return True, ""
 
 
+# ---------- Утилиты: единицы ----------
+
+def _unit_from_question(question):
+    q = question.lower()
+    if "месяц" in q:
+        return r"месяц"
+    if "календарн" in q or "дн" in q:
+        return r"(?:календарн\w*\s+)?дн"
+    if "год" in q or "лет" in q:
+        return r"(?:год|лет)"
+    if "процент" in q or "%" in q:
+        return r"(?:%|процент)"
+    return None
+
+
+def _unit_kind(question):
+    q = question.lower()
+    if "месяц" in q:
+        return "months"
+    if "календарн" in q or "дн" in q:
+        return "days"
+    if "год" in q or "лет" in q:
+        return "years"
+    if "процент" in q or "%" in q:
+        return "percent"
+    return None
+
+
+def _value_matches_unit(doc_text_norm, value_norm, unit_pattern):
+    if not unit_pattern:
+        return True
+    pattern = re.escape(value_norm) + r"[^\d]{0,80}(?:" + unit_pattern + r")"
+    return bool(re.search(pattern, doc_text_norm))
+
+
 # ---------- Критик расхождений ----------
-
-def _value_near_trigger(doc_text_norm, value_norm, triggers):
-    """Есть ли значение в тексте рядом со словом-триггером (±200 символов)."""
-    idx = 0
-    while True:
-        idx = doc_text_norm.find(value_norm, idx)
-        if idx == -1:
-            return False
-        window = doc_text_norm[max(0, idx - 200): idx + 200]
-        if any(t in window for t in triggers):
-            return True
-        idx += len(value_norm)
-
 
 FIND_CONTRADICTIONS_PROMPT = """Задача: найти РАСХОЖДЕНИЯ между файлами.
 ВОПРОС: {question}
@@ -173,46 +195,80 @@ FIND_CONTRADICTIONS_PROMPT = """Задача: найти РАСХОЖДЕНИЯ 
 """
 
 
+def _regex_contradiction_backstop(question, docs_norm):
+    q = question.lower()
+    if "гарант" in q:
+        trigger_re = re.compile(r"гарант\w*")
+    elif "срок" in q:
+        trigger_re = re.compile(r"срок\w*")
+    else:
+        return {}
+
+    unit_pattern = _unit_from_question(question)
+    if not unit_pattern:
+        return {}
+
+    num_unit_re = re.compile(
+        r"(\d+(?:[.,]\d+)?)[^\d]{0,30}(?:" + unit_pattern + r")"
+    )
+    values = {}
+    for fname, text in docs_norm.items():
+        for tm in trigger_re.finditer(text):
+            window = text[tm.start():tm.start() + 250]
+            for nm in num_unit_re.finditer(window):
+                val = nm.group(1).replace(",", ".")
+                values.setdefault(val, set()).add(fname)
+    return values
+
+
 def find_contradictions(question, docs, ans):
     q_lower = question.lower()
     triggers = [t for t in CONTRADICTION_TRIGGERS if t in q_lower]
     if not triggers or ans["status"] != "ответ":
         return ans
 
+    docs_norm = {n: norm(t) for n, t in docs.items()}
+    unit_pattern = _unit_from_question(question)
+
     docs_short = {n: t[:2500] for n, t in docs.items()}
     docs_text = "\n\n".join(f"=== ФАЙЛ: {n} ===\n{t}" for n, t in docs_short.items())
     prompt = FIND_CONTRADICTIONS_PROMPT.format(question=question, docs=docs_text)
 
+    unique = {}
     try:
         raw = ask_llm([{"role": "user", "content": prompt}])
         result = extract_json(raw)
+        if isinstance(result, dict):
+            for fname, val in result.items():
+                if not isinstance(val, str):
+                    continue
+                v_lower = val.lower().strip()
+                if v_lower in ("нет", "не найдено", "отсутствует", "не установлено",
+                               "не требуется", "none", ""):
+                    continue
+                if fname not in docs_norm:
+                    continue
+                for n in re.findall(r"\d+(?:[.,]\d+)?", val):
+                    n_norm = norm(n)
+                    if not _value_matches_unit(docs_norm[fname], n_norm, unit_pattern):
+                        print(f"    find_contradictions: {n} в {fname} не в единице")
+                        continue
+                    if n_norm not in unique:
+                        unique[n_norm] = fname
     except Exception as e:
         print(f"    find_contradictions: LLM ошибка ({e})")
-        return ans
 
-    if not isinstance(result, dict):
-        return ans
-
-    docs_norm = {n: norm(t) for n, t in docs.items()}
-    unique = {}
-    for fname, val in result.items():
-        if not isinstance(val, str):
-            continue
-        v_lower = val.lower().strip()
-        if v_lower in ("нет", "не найдено", "отсутствует", "не установлено",
-                       "не требуется", "none", ""):
-            continue
-        if fname not in docs_norm:
-            continue
-        for n in re.findall(r"\d+(?:[.,]\d+)?", val):
-            n_norm = norm(n)
-            if not _value_near_trigger(docs_norm[fname], n_norm, triggers):
-                continue
-            if n_norm not in unique:
-                unique[n_norm] = (fname, n)
+    if len(unique) < 2:
+        backstop = _regex_contradiction_backstop(question, docs_norm)
+        all_files = set()
+        for fs in backstop.values():
+            all_files |= fs
+        if len(backstop) >= 2 and len(all_files) >= 2:
+            print(f"    find_contradictions: бэкстоп нашёл {sorted(backstop.keys())}")
+            unique = {v: sorted(fs)[0] for v, fs in backstop.items()}
 
     if len(unique) >= 2:
-        parts = [f"{n} (в {fname})" for n, (fname, _) in unique.items()]
+        parts = [f"{v} (в {f})" for v, f in unique.items()]
         print(f"    find_contradictions: {len(unique)} значений → {' и '.join(parts)[:100]}")
         ans["status"] = "расхождение"
         ans["answer"] = " и ".join(parts)
@@ -220,6 +276,132 @@ def find_contradictions(question, docs, ans):
         print(f"    find_contradictions: подтверждено {len(unique)} значение")
     return ans
 
+
+# ---------- Пост-обработка: «не требуется» ----------
+
+def override_no_requirement(question, docs, ans):
+    if ans["status"] != "нет в документах":
+        return ans
+    q_lower = question.lower()
+    if "обеспечен" in q_lower and "заявк" in q_lower:
+        primary, context = "обеспечени", "заявк"
+    elif "обеспечен" in q_lower and "исполнен" in q_lower:
+        primary, context = "обеспечени", "исполнени"
+    elif "гарантийн" in q_lower and "обеспечен" in q_lower:
+        primary, context = "гарантийн", "обеспечен"
+    elif "лицензи" in q_lower and "фсб" in q_lower:
+        primary, context = "лицензи", "фсб"
+    else:
+        return ans
+
+    neg_phrases = ["не установлен", "не требуется", "не предусмотрен"]
+
+    for fname, text in docs.items():
+        text_lower = text.lower()
+        for m in re.finditer(primary, text_lower):
+            window = text_lower[max(0, m.start() - 30):m.start() + 350]
+            if context not in window:
+                continue
+            if not any(p in window for p in neg_phrases):
+                continue
+            sent_start = text.rfind(".", 0, m.start())
+            if sent_start == -1 or m.start() - sent_start > 300:
+                sent_start = max(0, m.start() - 50)
+            else:
+                sent_start += 1
+            while sent_start < len(text) and text[sent_start].isspace():
+                sent_start += 1
+            sent_end = text.find(".", m.start())
+            if sent_end == -1 or sent_end - sent_start > 300:
+                sent_end = m.start() + 200
+            else:
+                sent_end += 1
+            quote = text[sent_start:sent_end].strip()
+            print(f"    override: «нет в документах» → «не требуется» ({fname})")
+            return {"status": "ответ", "answer": "не требуется",
+                    "quote": quote, "file": fname}
+    return ans
+
+
+# ---------- Пост-обработка: пересчёт обеспечения ----------
+
+def recalc_contract_security_rub(question, docs, ans):
+    q_lower = question.lower()
+    if not ("обеспечен" in q_lower and "исполнен" in q_lower):
+        return ans
+    if "руб" not in q_lower and "составит" not in q_lower:
+        return ans
+    if ans["status"] != "ответ":
+        return ans
+
+    nmck = None
+    for text in docs.values():
+        m = re.search(
+            r"Начальная\s*\(максимальная\)\s*цена\s*контракта[:\s]*([\d ]+[.,]?\d*)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            try:
+                nmck = float(re.sub(r"\s", "", m.group(1)).replace(",", "."))
+                break
+            except ValueError:
+                pass
+    if not nmck:
+        return ans
+
+    ordered = sorted(
+        docs.items(),
+        key=lambda kv: (0 if "izmenen" in kv[0].lower() else 1, kv[0]),
+    )
+    percent, percent_file = None, None
+    for fname, text in ordered:
+        is_change = "izmenen" in fname.lower()
+        found = False
+        for m in re.finditer(
+            r"обеспечени[ея]\s+исполнени[яя]\s+контракта", text, re.IGNORECASE,
+        ):
+            window = text[m.start():m.start() + 500]
+            all_pct = re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:%|процент)", window)
+            if not all_pct:
+                continue
+            chosen = all_pct[-1] if is_change else all_pct[0]
+            try:
+                percent = float(chosen.replace(",", "."))
+                percent_file = fname
+                found = True
+                break
+            except ValueError:
+                continue
+        if found:
+            break
+
+    if percent is None:
+        return ans
+
+    correct = nmck * percent / 100
+    correct_str = str(int(correct)) if correct == int(correct) else str(correct)
+    print(f"    recalc: NMCK={nmck}, %={percent} ({percent_file}) → {correct_str}")
+    ans["answer"] = correct_str
+
+    if percent_file:
+        for m in re.finditer(
+            r"обеспечени[ея]\s+исполнени[яя]\s+контракта",
+            docs[percent_file], re.IGNORECASE,
+        ):
+            start = m.start()
+            end = docs[percent_file].find(".", start)
+            if end == -1 or end - start > 300:
+                end = start + 200
+            else:
+                end += 1
+            ans["quote"] = docs[percent_file][start:end].strip()
+            ans["file"] = percent_file
+            break
+
+    return ans
+
+
+# ---------- Основной цикл ----------
 
 def normalize_answer(ans):
     if not isinstance(ans, dict):
@@ -314,7 +496,11 @@ def main():
 
         print(f"[{i}/{len(questions)}] {q['id']}: {q['question'][:60]}...")
         ans = solve_question(q["question"], docs)
+
         ans = find_contradictions(q["question"], docs, ans)
+        ans = override_no_requirement(q["question"], docs, ans)
+        ans = recalc_contract_security_rub(q["question"], docs, ans)
+
         rows.append({"id": q["id"], **ans})
         print(f"  → {ans['status']}: {ans['answer'][:80]}")
 
