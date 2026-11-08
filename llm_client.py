@@ -16,19 +16,9 @@ PROVIDERS = {
     "gigachat": {
         "chat_url": "https://api.giga.chat/v1/chat/completions",
         "auth_url": "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-        "default_model": "GigaChat-2",          # быстрая модель для старта
+        "default_model": "GigaChat-2-Pro",          # быстрая модель для старта
         "key_required": False,                   # авторизация через OAuth
         "scope": "GIGACHAT_API_PERS",            # для физических лиц
-    },
-    "groq": {
-        "chat_url": "https://api.groq.com/openai/v1/chat/completions",
-        "default_model": "openai/gpt-oss-120b",
-        "key_required": True,
-    },
-    "openrouter": {
-        "chat_url": "https://openrouter.ai/api/v1/chat/completions",
-        "default_model": "meta-llama/llama-3.3-70b-instruct:free",
-        "key_required": True,
     },
 }
 

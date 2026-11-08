@@ -1,11 +1,17 @@
 """
-Прогон baseline: задаём модели вопросы «как есть», без проверок.
+v1-baseline: наивный прогон «как есть».
+
+Задание: «Задайте модели вопросы "как есть", одним запросом».
+Здесь нет ни роли, ни инструкций про цитаты, ни правил про типы status —
+модель получает документы, вопрос и минимальную схему JSON. Это честная
+точка «было», на которой видно, сколько ИИ обманывает без инженерии.
+
 Результат: answers_baseline.csv (формат как у check.py).
 
 Запуск:
-  python run_baseline.py                      # все вопросы
-  python run_baseline.py --limit 5            # первые 5 (для теста)
-  python run_baseline.py --packages P01 P02   # только эти закупки
+  python run_baseline.py
+  python run_baseline.py --limit 5
+  python run_baseline.py --packages P01 P02
 """
 import argparse
 import csv
@@ -18,11 +24,6 @@ from check import read_file
 HERE = Path(__file__).resolve().parent
 QUESTIONS = HERE / "questions.csv"
 PACKAGES = HERE / "packages"
-
-SYSTEM_PROMPT = (
-    "Ты помощник по анализу документов госзакупок. "
-    "Отвечай на вопросы, опираясь ТОЛЬКО на текст предоставленных документов."
-)
 
 
 def load_questions(path):
@@ -38,34 +39,53 @@ def load_package_docs(package):
 
 
 def build_prompt(question, docs):
+    """Минимальный промпт: только документы, вопрос и схема JSON."""
     docs_text = "\n\n".join(
         f"=== ФАЙЛ: {name} ===\n{text}" for name, text in docs.items()
     )
-    return f"""Ниже документы закупки. Ответь на вопрос.
-
-ДОКУМЕНТЫ:
-{docs_text}
+    return f"""{docs_text}
 
 ВОПРОС: {question}
 
-Верни ТОЛЬКО JSON без markdown-обёртки:
-{{"status": "ответ" или "расхождение" или "нет в документах" или "не знаю",
-  "answer": "значение (число/дата/да/нет/текст)",
-  "quote": "дословная цитата из документа, откуда взят ответ",
-  "file": "имя_файла.txt"}}
+Ответь в формате JSON:
+{{"status": "...", "answer": "...", "quote": "...", "file": "..."}}
 """
 
 
 def normalize_answer(ans):
-    """Приводит ответ модели к 4 полям; невалидный status → 'не знаю'."""
+    """
+    Приводит ответ модели к 4 полям.
+    Если status нет или он не по-русски — но answer непустой,
+    считаем это ответом: baseline не умеет различать типы, но ответ модели
+    должен быть учтён. Иначе замер врёт.
+    """
     if not isinstance(ans, dict):
         return {"status": "не знаю", "answer": "", "quote": "", "file": ""}
+
+    answer = str(ans.get("answer") or "").strip()
     status = str(ans.get("status", "")).strip().lower()
+
+    # Английские и «сырые» варианты → русские
+    status_map = {
+        "answer": "ответ", "yes": "ответ", "ok": "ответ",
+        "response": "ответ", "found": "ответ",
+        "discrepancy": "расхождение", "contradiction": "расхождение",
+        "not_in_documents": "нет в документах",
+        "not found": "нет в документах", "absent": "нет в документах",
+        "unknown": "не знаю", "idk": "не знаю", "": "не знаю",
+    }
+    status = status_map.get(status, status)
+
+    # Fallback: если status невалидный, но answer есть — это ответ
     if status not in ("ответ", "расхождение", "нет в документах", "не знаю"):
-        status = "не знаю"
+        if answer:
+            status = "ответ"
+        else:
+            status = "не знаю"
+
     return {
         "status": status,
-        "answer": str(ans.get("answer") or ""),
+        "answer": answer,
         "quote": str(ans.get("quote") or ""),
         "file": str(ans.get("file") or ""),
     }
@@ -81,8 +101,8 @@ def write_answers(rows, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=0, help="обработать только первые N вопросов")
-    ap.add_argument("--packages", nargs="*", default=None, help="фильтр по закупкам, напр. P01 P02")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--packages", nargs="*", default=None)
     ap.add_argument("--out", default=str(HERE / "answers_baseline.csv"))
     args = ap.parse_args()
 
@@ -105,14 +125,14 @@ def main():
         print(f"[{i}/{len(questions)}] {q['id']}: {q['question'][:60]}...")
         try:
             raw = ask_llm([
-                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": build_prompt(q["question"], docs)},
             ])
             ans = extract_json(raw)
             row = {"id": q["id"], **normalize_answer(ans)}
         except Exception as e:
             print(f"  ОШИБКА: {e}")
-            row = {"id": q["id"], "status": "не знаю", "answer": "", "quote": "", "file": ""}
+            row = {"id": q["id"], "status": "не знаю",
+                   "answer": "", "quote": "", "file": ""}
 
         rows.append(row)
         print(f"  → {row['status']}: {row['answer'][:80]}")

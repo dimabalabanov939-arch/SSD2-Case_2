@@ -1,14 +1,18 @@
 """
-v7: итерация на GigaChat-2-Pro с честным кэшем.
+v7: итерация на GigaChat-2-Pro без кэша.
 
 Что нового против v6:
-  - llm_cache.make_key включает LLM_MODEL и LLM_PROVIDER
-    (без этого кэш смешивает ответы GigaChat-2 и GigaChat-2-Pro)
   - SYSTEM_PROMPT: правило для вопросов «какие лицензии должны быть» vs
     «нужна ли лицензия X» — на Pro модель путала эти формулировки (P06-06)
   - _unit_kind: категория единицы (days/months/years/percent)
   - _is_likely_item_number: отсеивает 4.3., 2.1. (в модельном пути И в бэкстопе)
   - _extract_quote_around: правильная цитата в override_no_requirement
+  - Кэш убран: каждый прогон — живые вызовы GigaChat (честно, без «заготовки»)
+
+Пост-обработки:
+  1. find_contradictions: расхождения по сроку/гарантии (модель + бэкстоп).
+  2. override_no_requirement: «нет в документах» → «не требуется».
+  3. recalc_contract_security_rub: NMCK × %, приоритет 05, в 05 последний %.
 """
 import argparse
 import csv
@@ -19,7 +23,6 @@ import sys
 from pathlib import Path
 
 from llm_client import ask_llm, extract_json
-from llm_cache import cached_call, flush as cache_flush, stats as cache_stats
 from check import read_file, norm
 
 HERE = Path(__file__).resolve().parent
@@ -178,7 +181,7 @@ def _unit_from_question(question):
     return None
 
 
-def _unit_kind(question):  # ← НОВОЕ
+def _unit_kind(question):
     """Категория единицы: days/months/years/percent/None."""
     q = question.lower()
     if "месяц" in q:
@@ -199,7 +202,7 @@ def _value_matches_unit(doc_text_norm, value_norm, unit_pattern):
     return bool(re.search(pattern, doc_text_norm))
 
 
-def _is_likely_item_number(value, question):  # ← НОВОЕ
+def _is_likely_item_number(value, question):
     """4.3., 2.1. — номера пунктов, не значения для дней/месяцев/лет."""
     if not (("." in value) or ("," in value)):
         return False
@@ -253,7 +256,7 @@ def _regex_contradiction_backstop(question, docs_norm):
                 continue
             for nm in num_unit_re.finditer(window):
                 val = nm.group(1).replace(",", ".")
-                if _is_likely_item_number(val, question):  # ← НОВОЕ
+                if _is_likely_item_number(val, question):
                     continue
                 values.setdefault(val, set()).add(fname)
     return values
@@ -267,7 +270,7 @@ def find_contradictions(question, docs, ans):
 
     docs_norm = {n: norm(t) for n, t in docs.items()}
     unit_pattern = _unit_from_question(question)
-    unit_kind = _unit_kind(question)  # ← НОВОЕ
+    unit_kind = _unit_kind(question)
 
     docs_short = {n: t[:2500] for n, t in docs.items()}
     docs_text = "\n\n".join(f"=== ФАЙЛ: {n} ===\n{t}" for n, t in docs_short.items())
@@ -275,7 +278,7 @@ def find_contradictions(question, docs, ans):
 
     unique = {}
     try:
-        raw = cached_call(ask_llm, [{"role": "user", "content": prompt}])
+        raw = ask_llm([{"role": "user", "content": prompt}])
         result = extract_json(raw)
         if isinstance(result, dict):
             for fname, val in result.items():
@@ -289,15 +292,12 @@ def find_contradictions(question, docs, ans):
                     continue
                 for n in re.findall(r"\d+(?:[.,]\d+)?", val):
                     n_norm = norm(n)
-                    # ← НОВОЕ: фильтр 1 — номер пункта
                     if _is_likely_item_number(n_norm, question):
                         print(f"    find_contradictions: {n} — номер пункта, пропускаем")
                         continue
-                    # ← НОВОЕ: фильтр 2 — десятичное для дней/месяцев/лет
                     if ("." in n_norm or "," in n) and unit_kind in ("days", "months", "years"):
                         print(f"    find_contradictions: {n} — десятичное для {unit_kind}, пропускаем")
                         continue
-                    # фильтр 3 — единица измерения
                     if not _value_matches_unit(docs_norm[fname], n_norm, unit_pattern):
                         print(f"    find_contradictions: {n} в {fname} не в единице")
                         continue
@@ -327,7 +327,7 @@ def find_contradictions(question, docs, ans):
 
 # ---------- Пост-обработка: «не требуется» ----------
 
-def _extract_quote_around(text, phrase_pos, phrase_len, window=150):  # ← НОВОЕ
+def _extract_quote_around(text, phrase_pos, phrase_len, window=150):
     """Вырезает окно вокруг фразы, обрезая по границам слов."""
     left = max(0, phrase_pos - window)
     right = min(len(text), phrase_pos + phrase_len + window)
@@ -372,7 +372,7 @@ def override_no_requirement(question, docs, ans):
             neg_pos = text_lower.find(hit, max(0, m.start() - 30))
             if neg_pos == -1:
                 continue
-            quote = _extract_quote_around(text, neg_pos, len(hit))  # ← НОВОЕ
+            quote = _extract_quote_around(text, neg_pos, len(hit))
             if norm(quote) not in norm(text):
                 quote = text[neg_pos:neg_pos + len(hit) + 80].strip()
             print(f"    override: «нет в документах» → «не требуется» ({fname}), "
@@ -493,7 +493,7 @@ def solve_question(question, docs):
 
     for attempt in range(MAX_ATTEMPTS):
         try:
-            raw = cached_call(ask_llm, messages)
+            raw = ask_llm(messages)
         except Exception as e:
             print(f"    LLM ошибка: {e}")
             return {"status": "не знаю", "answer": "", "quote": "", "file": ""}
@@ -566,8 +566,6 @@ def main():
     write_answers(rows, args.out)
     print(f"\nСохранено: {args.out}")
     print(f"Дальше: python check.py {args.out}")
-    cache_flush()
-    print(f"Кэш: {cache_stats()}")
 
 
 if __name__ == "__main__":

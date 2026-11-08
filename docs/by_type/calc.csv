@@ -1,0 +1,3 @@
+script;верно;осторожно;обман
+run_baseline.py;6;0;0
+run_improved.py;6;0;0
